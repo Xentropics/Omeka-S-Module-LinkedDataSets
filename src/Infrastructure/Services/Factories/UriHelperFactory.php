@@ -10,8 +10,14 @@ class UriHelperFactory implements FactoryInterface
 {
     public function __invoke(ContainerInterface $serviceLocator, $requestedName, array $options = null)
     {
-        return new UriHelper(
-            $serviceLocator->get('ViewHelperManager')
-        );
+        try {
+            $viewHelperManager = $serviceLocator->get('ViewHelperManager');
+            return new UriHelper($viewHelperManager);
+        } catch (\Exception $e) {
+            // Fallback: try to get view helper manager through application services
+            $application = $serviceLocator->get('Application');
+            $viewHelperManager = $application->getServiceManager()->get('ViewHelperManager');
+            return new UriHelper($viewHelperManager);
+        }
     }
 }

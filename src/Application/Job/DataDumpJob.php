@@ -14,6 +14,7 @@ use Laminas\ServiceManager\ServiceLocatorInterface;
 use LinkedDataSets\Application\Dto\DistributionDto;
 use LinkedDataSets\Application\Service\DistributionService;
 use LinkedDataSets\Application\Service\ItemSetCrawler;
+use LinkedDataSets\Infrastructure\Helpers\UriHelper;
 use LinkedDataSets\Application\Service\UpdateDistributionService;
 use LinkedDataSets\Infrastructure\Exception\DistributionNotDefinedException;
 use LinkedDataSets\Infrastructure\Exception\FormatNotSupportedException;
@@ -58,7 +59,20 @@ final class DataDumpJob extends AbstractJob
         if (!$this->logger) {
             throw new ServiceNotFoundException('The logger service is not found');
         }
-        $this->uriHelper = $serviceLocator->get('LDS\UriHelper');
+
+        // Debug: Check if UriHelper service is registered
+        if (!$serviceLocator->has('LDS\UriHelper')) {
+            // Try to create UriHelper directly if service is not available
+            try {
+                $viewHelperManager = $serviceLocator->get('ViewHelperManager');
+                $this->uriHelper = new UriHelper($viewHelperManager);
+            } catch (\Exception $e) {
+                throw new ServiceNotFoundException('Cannot create UriHelper: ' . $e->getMessage());
+            }
+        } else {
+            $this->uriHelper = $serviceLocator->get('LDS\UriHelper');
+        }
+
         if (!$this->uriHelper) {
             throw new ServiceNotFoundException('The UriHelper service is not found');
         }
@@ -92,7 +106,6 @@ final class DataDumpJob extends AbstractJob
         if (!$this->dispatcher) {
             throw new ServiceNotFoundException('The job dispatcher service is not found');
         }
-        
     }
 
 
@@ -116,7 +129,7 @@ final class DataDumpJob extends AbstractJob
             $distributions = $this->distributionService->getDistributions($graph);
         } catch (FormatNotSupportedException $e) {
             $this->logger->info(
-                "Format {$e->format} for DataSet {$this->id} is not supported, no dump is created"
+                "Format not supported for DataSet {$this->id}, no dump is created: " . $e->getMessage()
             );
             return;
         } catch (DistributionNotDefinedException $e) {

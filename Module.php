@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace LinkedDataSets;
 
-use Generic\AbstractModule as GenericModule;
+use LinkedDataSets\Core\AbstractModule as GenericModule;
 use Laminas\EventManager\Event;
 use Laminas\EventManager\SharedEventManagerInterface;
 use Laminas\ServiceManager\ServiceLocatorInterface;
@@ -17,12 +17,11 @@ use Omeka\Module\Exception\ModuleCannotInstallException;
 use Omeka\Module\Module as DefaultModule;
 use Omeka\Stdlib\Message;
 
-// see https://gitlab.com/Daniel-KM/Omeka-S-module-Generic
-if (!class_exists(\Generic\AbstractModule::class)) {
-    require file_exists(dirname(__DIR__) . '/Generic/AbstractModule.php')
-        ? dirname(__DIR__) . '/Generic/AbstractModule.php'
-        : __DIR__ . '/src/Generic/AbstractModule.php';
-}
+// Required before class declaration since composer autoloader isn't available yet
+require_once __DIR__ . '/src/Core/AbstractModule.php';
+require_once __DIR__ . '/src/Core/InstallResources.php';
+require_once __DIR__ . '/src/Core/ResourceTemplateMergeHelper.php';
+require_once __DIR__ . '/src/Core/CustomVocabMergeHelper.php';
 
 final class Module extends GenericModule
 {
@@ -39,6 +38,18 @@ final class Module extends GenericModule
     public function getConfig()
     {
         return include __DIR__ . '/config/module.config.php';
+    }
+
+    public function getAutoloaderConfig()
+    {
+        return [
+            'Laminas\\Loader\\StandardAutoloader' => [
+                'namespaces' => [
+                    // Map the namespace to the directory that contains the classes
+                    'LinkedDataSets' => __DIR__ . '/src',
+                ],
+            ],
+        ];
     }
 
     public function setServiceLocator(ServiceLocatorInterface $serviceLocator)
@@ -59,14 +70,14 @@ final class Module extends GenericModule
         /* @var DefaultModule $module */
         foreach ($this->config['dependencies']['modules'] as $moduleDependency) {
             $module = $serviceLocator->get('Omeka\ModuleManager')
-                ->getModule($moduleDependency['name'])
-            ;
+                ->getModule($moduleDependency['name']);
 
             if ($module && version_compare($module->getIni('version') ?? '', $moduleDependency['version'], '<')) {
                 $translator = $serviceLocator->get('MvcTranslator');
                 $message = new Message(
                     $translator->translate('This module requires the module "%s", version %s or above.'), // @translate
-                    $moduleDependency['name'], $moduleDependency['version']
+                    $moduleDependency['name'],
+                    $moduleDependency['version']
                 );
                 throw new ModuleCannotInstallException((string) $message);
             }
@@ -139,13 +150,14 @@ final class Module extends GenericModule
         $label = $resourceTemplate ? $resourceTemplate->label() : null; // added null check to prevent error when resource template not set
         $useBackground = true; // later in config?
 
-        if ( $label === 'LDS Dataset' ) {
+        if ($label === 'LDS Dataset') {
             $job = $useBackground
-                ? $dispatcher->dispatch(DataDumpJob::class, [ 'id' => $id ]) // async
-                : $dispatcher->dispatch(DataDumpJob::class, [ 'id' => $id ], $this->getServiceLocator()->get(Synchronous::class));
+                ? $dispatcher->dispatch(DataDumpJob::class, ['id' => $id]) // async
+                : $dispatcher->dispatch(DataDumpJob::class, ['id' => $id], $this->getServiceLocator()->get(Synchronous::class));
         } else {
-            if ( $label === 'LDS Datacatalog' ||
-                 $label === 'LDS Distribution'
+            if (
+                $label === 'LDS Datacatalog' ||
+                $label === 'LDS Distribution'
             ) {
                 $job = $useBackground
                     ? $dispatcher->dispatch(RecreateDataCatalogsJob::class, []) // async

@@ -10,6 +10,9 @@ use LinkedDataSets\Infrastructure\Services\Factories\FilesystemServiceFactory;
 use LinkedDataSets\Infrastructure\Services\Factories\ItemSetCrawlerFactory;
 use LinkedDataSets\Infrastructure\Services\Factories\UpdateDistributionServiceFactory;
 use LinkedDataSets\Infrastructure\Services\Factories\UriHelperFactory;
+use Laminas\ServiceManager\Factory\InvokableFactory;
+use LinkedDataSets\Core\ResourceTemplateMergeHelper;
+use LinkedDataSets\Core\CustomVocabMergeHelper;
 
 return [
     'service_manager' => [
@@ -21,17 +24,18 @@ return [
             'LDS\UriHelper' => UriHelperFactory::class,
             'LDS\CatalogDumpService' => CatalogDumpServiceFactory::class,
             'LDS\UpdateDistributionService' => UpdateDistributionServiceFactory::class,
-            'LDS\FilesystemService' => FilesystemServiceFactory::class,
+            'LDS\FilesystemService' => FilesystemServiceFactory::class
         ]
     ],
     'dependencies' => [
         'modules' => [
             ['name' => 'CustomVocab', 'version' => '1.7.1'],
             ['name' => 'NumericDataTypes', 'version' => '1.11.0'],
-            ],
         ],
+    ],
     'folders' => [
         ["path" => 'files/datacatalogs/'],
         ["path" => 'files/datadumps/'],
     ],
+
 ];

@@ -46,7 +46,7 @@ final class CatalogDumpService
         $graph = new Graph(); //dep injection?
 
         # Step 1 - get data catalog
-            $graph->parse($apiUrl, 'jsonld');
+        $graph->parse($apiUrl, 'jsonld');
 
         foreach ($graph->resources() as $resource) {
             # Step 2 - get all datasets which are part of the data catalog
@@ -56,7 +56,7 @@ final class CatalogDumpService
                 $graph->parse($datasetUri, 'jsonld');
             }
 
-            # Step 3 - get all distribution which are part of datasets
+            # Step 3 - get all distributions which are part of datasets
             $distributions = $resource->allResources("schema:distribution");
 
             foreach ($distributions as $distribution) {
@@ -79,11 +79,19 @@ final class CatalogDumpService
                 $graph->parse($creatorUri, 'jsonld');
             }
 
+            # Step 4b get additional entities, e.g. funders and contact points
             $funders = $resource->allResources("schema:funder");
 
             foreach ($funders as $funder) {
                 $funderUri = $funder->getUri();
                 $graph->parse($funderUri, 'jsonld');
+            }
+
+            $contactPoints = $resource->allResources("schema:contactPoint");
+
+            foreach ($contactPoints as $contactPoint) {
+                $contactPointUri = $contactPoint->getUri();
+                $graph->parse($contactPointUri, 'jsonld');
             }
         }
 
@@ -97,11 +105,11 @@ final class CatalogDumpService
     protected function removeOmekaTags(Graph $graph): void
     {
         foreach ($graph->resources() as $resource) {
-            if (preg_match("/\/resources\//",$resource->getUri())) {
-                foreach($resource->properties() as $pu) {
-                    $graph->delete($resource,$pu);
+            if (preg_match("/\/resources\//", $resource->getUri())) {
+                foreach ($resource->properties() as $pu) {
+                    $graph->delete($resource, $pu);
                 }
-                foreach($resource->propertyUris() as $pu) {
+                foreach ($resource->propertyUris() as $pu) {
                     $resource->delete($pu);
                 }
             } else {
@@ -132,8 +140,8 @@ final class CatalogDumpService
             file_put_contents(OMEKA_PATH . "/files/datacatalogs/{$fileName}." . $extension, $content);
             $this->logger->notice(
                 "The file {$fileName}.{$extension} is available at " .
-                $this->uriHelper->constructUri() .
-                "/files/datacatalogs/{$fileName}." . "$extension"
+                    $this->uriHelper->constructUri() .
+                    "/files/datacatalogs/{$fileName}." . "$extension"
             );
         }
     }

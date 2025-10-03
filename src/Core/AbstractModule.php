@@ -29,7 +29,7 @@ declare(strict_types=1);
  * knowledge of the CeCILL license and that you accept its terms.
  */
 
-namespace Generic;
+namespace LinkedDataSets\Core;
 
 use Laminas\EventManager\Event;
 use Laminas\Mvc\Controller\AbstractController;
@@ -150,7 +150,7 @@ abstract class AbstractModule extends \Omeka\Module\AbstractModule
 
     public function getInstallResources(): ?InstallResources
     {
-        if (!class_exists(\Generic\InstallResources::class)) {
+        if (!class_exists(InstallResources::class)) {
             // Use the module file first, since it must be present with the
             // right version, even if AbstractModule is older in another module.
             if (file_exists($filepath = OMEKA_PATH . '/modules/' . static::NAMESPACE . '/src/Generic/InstallResources.php')) {
@@ -164,7 +164,7 @@ abstract class AbstractModule extends \Omeka\Module\AbstractModule
             }
         }
         $services = $this->getServiceLocator();
-        return new \Generic\InstallResources($services);
+        return new InstallResources($services);
     }
 
     public function checkAllResourcesToInstall(): bool
@@ -322,9 +322,7 @@ abstract class AbstractModule extends \Omeka\Module\AbstractModule
         return OMEKA_PATH . '/modules/' . static::NAMESPACE;
     }
 
-    protected function preInstall(): void
-    {
-    }
+    protected function preInstall(): void {}
 
     protected function postInstall(): void
     {
@@ -336,9 +334,7 @@ abstract class AbstractModule extends \Omeka\Module\AbstractModule
         }
     }
 
-    protected function preUninstall(): void
-    {
-    }
+    protected function preUninstall(): void {}
 
     protected function postUninstall(): void
     {

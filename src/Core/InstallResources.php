@@ -29,7 +29,10 @@ declare(strict_types=1);
  * knowledge of the CeCILL license and that you accept its terms.
  */
 
-namespace Generic;
+namespace LinkedDataSets\Core;
+
+require_once __DIR__ . '/CustomVocabMergeHelper.php';
+require_once __DIR__ . '/ResourceTemplateMergeHelper.php';
 
 use Laminas\ServiceManager\ServiceLocatorInterface;
 use Omeka\Api\Exception\NotFoundException;
@@ -38,6 +41,8 @@ use Omeka\Api\Representation\ResourceTemplateRepresentation;
 use Omeka\Entity\Vocabulary;
 use Omeka\Module\Exception\ModuleCannotInstallException;
 use Omeka\Stdlib\Message;
+use LinkedDataSets\Core\ResourceTemplateMergeHelper;
+use LinkedDataSets\Core\CustomVocabMergeHelper;
 
 class InstallResources
 {
@@ -141,18 +146,14 @@ class InstallResources
             }
         }
 
-        // Custom vocabs.
+        // Custom vocabs (always create or update; non-destructive merge on update).
         foreach ($this->listFilesInDir($filepathData . 'custom-vocabs') as $filepath) {
-            if (!$this->checkCustomVocab($filepath)) {
-                $this->createOrUpdateCustomVocab($filepath);
-            }
+            $this->createOrUpdateCustomVocab($filepath);
         }
 
-        // Resource templates.
+        // Resource templates (create or update; merge without deleting).
         foreach ($this->listFilesInDir($filepathData . 'resource-templates') as $filepath) {
-            if (!$this->checkResourceTemplate($filepath)) {
-                $this->createResourceTemplate($filepath);
-            }
+            $this->createOrUpdateResourceTemplate($filepath);
         }
 
         return $this;
@@ -217,7 +218,8 @@ class InstallResources
             return false;
         }
 
-        $template = $this->api->searchOne('resource_templates', ['label' => $data['o:label']])->getContent();
+        $resp = $this->api->searchOne('resource_templates', ['label' => $data['o:label']]);
+        $template = $resp ? $resp->getContent() : null;
         return !empty($template);
     }
 
@@ -561,7 +563,8 @@ SQL;
         // Check if the resource template exists, so it is not replaced.
         $label = $data['o:label'] ?? '';
 
-        $resourceTemplate = $this->api->searchOne('resource_templates', ['label' => $label])->getContent();
+        $resp = $this->api->searchOne('resource_templates', ['label' => $label]);
+        $resourceTemplate = $resp ? $resp->getContent() : null;
         if ($resourceTemplate) {
             $message = new Message(
                 'The resource template named "%s" is already available and is skipped.', // @translate
@@ -578,7 +581,259 @@ SQL;
         $data = $this->flagValid($data);
 
         // Process import.
-        return $this->api->create('resource_templates', $data)->getContent();
+        $response = $this->api->create('resource_templates', $data);
+        if (!$response) {
+            throw new RuntimeException(
+                (string) new Message(
+                    'Failed to create resource template "%s".', // @translate
+                    $label
+                )
+            );
+        }
+        return $response->getContent();
+    }
+
+    /**
+     * Create or update a resource template by label (non-destructive merge on update).
+     *
+     * @param string $filepath
+     * @return \Omeka\Api\Representation\ResourceTemplateRepresentation
+     * @throws \Omeka\Api\Exception\RuntimeException
+     */
+    public function createOrUpdateResourceTemplate(string $filepath): ResourceTemplateRepresentation
+    {
+        $data = json_decode(file_get_contents($filepath), true);
+        if (!$data || empty($data['o:label'])) {
+            throw new RuntimeException(
+                (string) new Message(
+                    'Resource template file "%s" missing or invalid.', // @translate
+                    basename($filepath)
+                )
+            );
+        }
+
+        $label = $data['o:label'];
+        /** @var \Omeka\Api\Representation\ResourceTemplateRepresentation|null $existing */
+        $resp = $this->api->searchOne('resource_templates', ['label' => $label]);
+        $existing = null;
+
+        if ($resp) {
+            $content = $resp->getContent();
+
+            // Handle case where API returns an ID instead of full object
+            if (is_int($content) || (is_string($content) && is_numeric($content))) {
+                // API returned an ID, fetch the full object
+                try {
+                    $existing = $this->api->read('resource_templates', $content)->getContent();
+                } catch (\Exception $e) {
+                    throw new RuntimeException(
+                        (string) new Message(
+                            'Failed to read resource template with ID %s for "%s": %s', // @translate
+                            $content,
+                            $label,
+                            $e->getMessage()
+                        )
+                    );
+                }
+            } elseif (is_object($content) && method_exists($content, 'id')) {
+                // API returned the full object as expected
+                $existing = $content;
+            } elseif (is_null($content)) {
+                // API returned null, meaning resource template doesn't exist - this is normal for creation
+                $existing = null;
+            } else {
+                // Simple error for unexpected API responses (no debug dump to avoid memory exhaustion)
+                $contentType = is_object($content) ? get_class($content) : gettype($content);
+                throw new RuntimeException(
+                    (string) new Message(
+                        'Unexpected API response for resource template "%s": expected object, ID, or NULL, got %s.', // @translate
+                        $label,
+                        $contentType
+                    )
+                );
+            }
+        }
+
+        // Final validation that we have a proper object
+        if ($existing && !method_exists($existing, 'id')) {
+            throw new RuntimeException(
+                (string) new Message(
+                    'Invalid resource template object for "%s": missing id() method (type: %s)', // @translate
+                    $label,
+                    is_object($existing) ? get_class($existing) : gettype($existing)
+                )
+            );
+        }
+
+        // Normalize/validate incoming (sets ids & data types).
+        $incoming = $this->flagValid($data);
+
+        if (!$existing) {
+            $response = $this->api->create('resource_templates', $incoming);
+            if (!$response) {
+                throw new RuntimeException(
+                    (string) new Message(
+                        'Failed to create resource template "%s".', // @translate
+                        $label
+                    )
+                );
+            }
+            return $response->getContent();
+        }
+
+        // Merge existing + incoming via helper.
+        /** @var ResourceTemplateMergeHelper $rtHelper */
+        $rtHelper = new ResourceTemplateMergeHelper();
+        $existingArr = $existing->jsonSerialize();
+        $merged = $rtHelper->merge($existingArr, $incoming);
+
+        // Clean up duplicate and invalid properties in merged payload
+        $originalPropertyCount = count($merged['o:resource_template_property'] ?? []);
+        $seenProperties = [];
+        $validProperties = [];
+
+        foreach ($merged['o:resource_template_property'] ?? [] as $i => $property) {
+            $propertyId = $property['o:property']['o:id'] ?? null;
+
+            if (!$propertyId) {
+                // Skip properties without valid property ID
+                continue;
+            }
+
+            // Check if we've seen this property ID before
+            if (isset($seenProperties[$propertyId])) {
+                // We have a duplicate - merge the data or skip incomplete ones
+                $existingPropertyIndex = $seenProperties[$propertyId];
+                $existingProperty = $validProperties[$existingPropertyIndex];
+
+                // Prefer the one with more complete vocabulary metadata
+                $hasVocabInfo = !empty($property['vocabulary_namespace_uri']) &&
+                    !empty($property['local_name']) &&
+                    !empty($property['vocabulary_prefix']);
+
+                $existingHasVocabInfo = !empty($existingProperty['vocabulary_namespace_uri']) &&
+                    !empty($existingProperty['local_name']) &&
+                    !empty($existingProperty['vocabulary_prefix']);
+
+                if ($hasVocabInfo && !$existingHasVocabInfo) {
+                    // Replace existing with more complete version
+                    $validProperties[$existingPropertyIndex] = $property;
+                }
+                // Otherwise keep the existing one
+                continue;
+            }
+
+            // Validate required fields for new property
+            $hasRequiredFields = !empty($property['o:property']['o:id']) &&
+                !empty($property['vocabulary_namespace_uri']) &&
+                !empty($property['local_name']) &&
+                !empty($property['vocabulary_prefix']);
+
+            if ($hasRequiredFields) {
+                $seenProperties[$propertyId] = count($validProperties);
+                $validProperties[] = $property;
+            }
+        }
+
+        // Update merged payload with cleaned properties
+        $merged['o:resource_template_property'] = array_values($validProperties);
+
+
+
+
+
+        // Ensure $existing is properly resolved to an object before update
+        if (!is_object($existing)) {
+            throw new RuntimeException(
+                (string) new Message(
+                    'Expected object for existing resource template "%s", got %s', // @translate
+                    $label,
+                    gettype($existing)
+                )
+            );
+        }
+
+        if (!method_exists($existing, 'id')) {
+            throw new RuntimeException(
+                (string) new Message(
+                    'Resource template object for "%s" missing id() method (class: %s)', // @translate
+                    $label,
+                    get_class($existing)
+                )
+            );
+        }
+
+        // Ensure all objects are converted to arrays for API compatibility
+        $merged = $this->deepArrayConvert($merged);
+
+        try {
+            $response = $this->api->update(
+                'resource_templates',
+                $existing->id(),
+                $merged,
+                [],
+                ['isPartial' => false]
+            );
+            if (!$response) {
+                throw new RuntimeException(
+                    (string) new Message(
+                        'Failed to update resource template "%s".', // @translate
+                        $label
+                    )
+                );
+            }
+            return $response->getContent();
+        } catch (\Omeka\Api\Exception\ValidationException $e) {
+            // Surface validation errors to help debugging.
+            $errors = method_exists($e, 'getErrorStore') ? $e->getErrorStore()->getErrors() : [];
+            $errFile = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'rt-errors-' . preg_replace('/[^a-z0-9]+/i', '-', $label) . '-' . date('Ymd-His') . '.log';
+
+            // Memory-safe error logging - limit size and use JSON for better structure
+            $errorOutput = '';
+            if (is_array($errors) && count($errors) > 0) {
+                $errorOutput = json_encode($errors, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT | JSON_PARTIAL_OUTPUT_ON_ERROR);
+                if (strlen($errorOutput) > 10000) {
+                    $errorOutput = substr($errorOutput, 0, 10000) . "\n...[truncated - output too large]";
+                }
+            } else {
+                $errorOutput = 'No detailed errors available';
+            }
+
+            @file_put_contents($errFile, $errorOutput . PHP_EOL . 'Message: ' . $e->getMessage());
+
+            $messenger = $this->services->get('ControllerPluginManager')->get('messenger');
+            $messenger->addError(new Message(
+                'Validation failed updating RT "%1$s". See %2$s for details.', // @translate
+                $label,
+                $errFile
+            ));
+
+            throw new RuntimeException(
+                (string) new Message(
+                    'Failed to update resource template "%s".', // @translate
+                    $label
+                )
+            );
+        } catch (\Throwable $e) {
+            // Last-resort debug info.
+            $errFile = rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'rt-exception-' . preg_replace('/[^a-z0-9]+/i', '-', $label) . '-' . date('Ymd-His') . '.log';
+            @file_put_contents($errFile, (string) $e);
+
+            $messenger = $this->services->get('ControllerPluginManager')->get('messenger');
+            $messenger->addError(new Message(
+                'Exception updating RT "%1$s". See %2$s for details. %3$s', // @translate
+                $label,
+                $errFile,
+                $e->getMessage()
+            ));
+
+            throw new RuntimeException(
+                (string) new Message(
+                    'Failed to update resource template "%s".', // @translate
+                    $label
+                )
+            );
+        }
     }
 
     /**
@@ -642,6 +897,7 @@ SQL;
      */
     protected function flagValid(iterable $import)
     {
+        $messenger = $this->services->get('ControllerPluginManager')->get('messenger');
         $vocabs = [];
 
         // The controller plugin Api is used to allow to search one resource.
@@ -651,9 +907,10 @@ SQL;
             if (isset($vocabs[$namespaceUri])) {
                 return $vocabs[$namespaceUri];
             }
-            $vocab = $api->searchOne('vocabularies', [
+            $resp = $api->searchOne('vocabularies', [
                 'namespace_uri' => $namespaceUri,
-            ])->getContent();
+            ]);
+            $vocab = $resp ? $resp->getContent() : null;
             if ($vocab) {
                 $vocabs[$namespaceUri] = $vocab;
                 return $vocab;
@@ -670,63 +927,104 @@ SQL;
         };
 
         // Manage core data types and common modules ones.
-        $getKnownDataType = function ($dataTypeNameLabel) use ($api): ?string {
+        $getKnownDataType = function ($dataTypeNameLabel) use ($api, $messenger): ?string {
+            // Core and well-known module data types pass through unchanged.
             if (
                 in_array($dataTypeNameLabel['name'], [
-                'literal',
-                'resource',
-                'resource:item',
-                'resource:itemset',
-                'resource:media',
-                'uri',
-                // DataTypeGeometry
-                'geography',
-                'geography:coordinates',
-                'geometry',
-                'geometry:coordinates',
-                'geometry:position',
-                // TODO Deprecated for v4.
-                'geometry:geometry',
-                'geometry:geography',
-                'geometry:geography:coordinates',
-                // DataTypeRdf.
-                'boolean',
-                'html',
-                'xml',
-                // DataTypePlace.
-                'place',
-                // NumericDataTypes
-                'numeric:timestamp',
-                'numeric:integer',
-                'numeric:duration',
-                'numeric:interval',
-                ])
+                    'literal',
+                    'resource',
+                    'resource:item',
+                    'resource:itemset',
+                    'resource:media',
+                    'uri',
+                    // DataTypeGeometry
+                    'geography',
+                    'geography:coordinates',
+                    'geometry',
+                    'geometry:coordinates',
+                    'geometry:position',
+                    // TODO Deprecated for v4.
+                    'geometry:geometry',
+                    'geometry:geography',
+                    'geometry:geography:coordinates',
+                    // DataTypeRdf.
+                    'boolean',
+                    'html',
+                    'xml',
+                    // DataTypePlace.
+                    'place',
+                    // NumericDataTypes
+                    'numeric:timestamp',
+                    'numeric:integer',
+                    'numeric:duration',
+                    'numeric:interval',
+                ], true)
                 || mb_substr((string) $dataTypeNameLabel['name'], 0, 13) === 'valuesuggest:'
                 || mb_substr((string) $dataTypeNameLabel['name'], 0, 16) === 'valuesuggestall:'
             ) {
                 return $dataTypeNameLabel['name'];
             }
 
+            // Handle custom vocabs: allow either "customvocab:{Label}" or "customvocab:123".
             if (mb_substr((string) $dataTypeNameLabel['name'], 0, 12) === 'customvocab:') {
-                try {
-                    $customVocab = $api->read('custom_vocabs', ['label' => $dataTypeNameLabel['label']])->getContent();
-                    return 'customvocab:' . $customVocab->id();
-                } catch (\Omeka\Api\Exception\NotFoundException $e) {
-                    return null;
+                $name = (string) $dataTypeNameLabel['name'];
+                $label = $dataTypeNameLabel['label'] ?? null;
+
+                // If no explicit label, try to extract from "customvocab:{Label}".
+                if (!$label && preg_match('/^customvocab:\{(.+)\}$/u', $name, $m)) {
+                    $label = trim($m[1]);
                 }
+
+                // If both numeric id and label are present, prefer label resolution.
+                if ($label) {
+                    try {
+                        /** @var \CustomVocab\Api\Representation\CustomVocabRepresentation $customVocab */
+                        $customVocab = $api->read('custom_vocabs', ['label' => $label])->getContent();
+                        return 'customvocab:' . $customVocab->id();
+                    } catch (\Omeka\Api\Exception\NotFoundException $e) {
+                        // Log and drop the datatype (do not throw).
+                        $messenger->addWarning(new \Omeka\Stdlib\Message(
+                            'Custom vocab "%s" was referenced in a resource template but was not found. The corresponding data type has been removed.', // @translate
+                            $label
+                        ));
+                        return null;
+                    }
+                }
+
+                // No label to resolve by — permit the numeric id as-is only if present.
+                if (preg_match('/^customvocab:(\d+)$/', $name)) {
+                    // Keep the numeric reference unchanged.
+                    return $name;
+                }
+
+                // Unknown/unsupported customvocab form: log and drop.
+                $messenger->addWarning(new \Omeka\Stdlib\Message(
+                    'A custom vocab reference "%s" could not be resolved and has been removed from the template.', // @translate
+                    $name
+                ));
+                return null;
             }
+
             return null;
         };
 
         if (isset($import['o:resource_class'])) {
             if ($vocab = $getVocab($import['o:resource_class']['vocabulary_namespace_uri'])) {
                 $import['o:resource_class']['vocabulary_prefix'] = $vocab->prefix();
-                $class = $api->searchOne('resource_classes', [
+                $resp = $api->searchOne('resource_classes', [
                     'vocabulary_namespace_uri' => $import['o:resource_class']['vocabulary_namespace_uri'],
                     'local_name' => $import['o:resource_class']['local_name'],
-                ])->getContent();
-                if ($class) {
-                    $import['o:resource_class']['o:id'] = $class->id();
+                ]);
+                $class = null;
+                if ($resp) {
+                    $content = $resp->getContent();
+                    if (is_int($content) || (is_string($content) && is_numeric($content))) {
+                        // API returned an ID, use it directly
+                        $import['o:resource_class']['o:id'] = (int) $content;
+                    } elseif (is_object($content) && method_exists($content, 'id')) {
+                        // API returned the full object
+                        $import['o:resource_class']['o:id'] = $content->id();
+                    }
                 }
             }
         }
@@ -735,12 +1033,19 @@ SQL;
             if (isset($import[$property])) {
                 if ($vocab = $getVocab($import[$property]['vocabulary_namespace_uri'])) {
                     $import[$property]['vocabulary_prefix'] = $vocab->prefix();
-                    $prop = $api->searchOne('properties', [
+                    $respP = $api->searchOne('properties', [
                         'vocabulary_namespace_uri' => $import[$property]['vocabulary_namespace_uri'],
                         'local_name' => $import[$property]['local_name'],
-                    ])->getContent();
-                    if ($prop) {
-                        $import[$property]['o:id'] = $prop->id();
+                    ]);
+                    if ($respP) {
+                        $content = $respP->getContent();
+                        if (is_int($content) || (is_string($content) && is_numeric($content))) {
+                            // API returned an ID, use it directly
+                            $import[$property]['o:id'] = (int) $content;
+                        } elseif (is_object($content) && method_exists($content, 'id')) {
+                            // API returned the full object
+                            $import[$property]['o:id'] = $content->id();
+                        }
                     }
                 }
             }
@@ -749,12 +1054,23 @@ SQL;
         foreach ($import['o:resource_template_property'] as $key => $property) {
             if ($vocab = $getVocab($property['vocabulary_namespace_uri'])) {
                 $import['o:resource_template_property'][$key]['vocabulary_prefix'] = $vocab->prefix();
-                $prop = $api->searchOne('properties', [
+                $respProp = $api->searchOne('properties', [
                     'vocabulary_namespace_uri' => $property['vocabulary_namespace_uri'],
                     'local_name' => $property['local_name'],
-                ])->getContent();
-                if ($prop) {
-                    $import['o:resource_template_property'][$key]['o:property'] = ['o:id' => $prop->id()];
+                ]);
+                $propId = null;
+                if ($respProp) {
+                    $content = $respProp->getContent();
+                    if (is_int($content) || (is_string($content) && is_numeric($content))) {
+                        // API returned an ID, use it directly
+                        $propId = (int) $content;
+                    } elseif (is_object($content) && method_exists($content, 'id')) {
+                        // API returned the full object
+                        $propId = $content->id();
+                    }
+                }
+                if ($propId) {
+                    $import['o:resource_template_property'][$key]['o:property'] = ['o:id' => $propId];
                     // Check the deprecated "data_type_name" if needed and
                     // normalize it.
                     if (!array_key_exists('data_types', $import['o:resource_template_property'][$key])) {
@@ -848,88 +1164,18 @@ SQL;
         $newUris = $data['o:uris'] ?? [];
         $newTerms = $data['o:terms'] ?? [];
 
-        $isV4 = version_compare(\Omeka\Module::VERSION, '4', '>=');
-        if (!$isV4) {
-            if ($newItemSet) {
-                $this->api->update('custom_vocabs', $customVocab->id(), [
-                    'o:label' => $label,
-                    'o:item_set' => $newItemSet,
-                    'o:terms' => '',
-                    'o:uris' => '',
-                ], [], ['isPartial' => true]);
-            } elseif ($newUris) {
-                $existingUris = $customVocab->uris();
-                if (!is_array($existingUris)) {
-                    $nu = [];
-                    foreach (explode("\n", $existingUris) as $existingUri) {
-                        [$uri, $uriLabel] = array_map('trim', explode("=", $existingUri, 2));
-                        $nu[$uri] = $uriLabel ?: $uri;
-                    }
-                    $existingUris = $nu;
-                }
-                if (!is_array($newUris)) {
-                    $nu = [];
-                    foreach (array_filter(explode("\n", $newUris)) as $newUri) {
-                        [$uri, $uriLabel] = array_map('trim', explode("=", $newUri, 2));
-                        $nu[$uri] = $uriLabel ?: $uri;
-                    }
-                    $newUris = $nu;
-                }
-                $newUris = array_replace($newUris, $existingUris, $newUris);
-                $newUrisString = '';
-                foreach ($newUris as $uri => $uriLabel) {
-                    $newUrisString .= $uri . ' = ' . $uriLabel . "\n";
-                }
-                $newUrisString = trim($newUrisString);
-                $this->api->update('custom_vocabs', $customVocab->id(), [
-                    'o:label' => $label,
-                    'o:item_set' => null,
-                    'o:terms' => '',
-                    'o:uris' => $newUrisString,
-                ], [], ['isPartial' => true]);
-            } elseif ($newTerms) {
-                $existingTerms = $customVocab->terms();
-                if (!is_array($existingTerms)) {
-                    $existingTerms = explode("\n", $existingTerms);
-                }
-                if (!is_array($newTerms)) {
-                    $newTerms = explode("\n", $newTerms);
-                }
-                $termsToStore = array_values(array_merge($existingTerms, $newTerms));
-                $this->api->update('custom_vocabs', $customVocab->id(), [
-                    'o:label' => $label,
-                    'o:item_set' => null,
-                    'o:terms' => implode("\n", $termsToStore),
-                    'o:uris' => '',
-                ], [], ['isPartial' => true]);
-            }
-            return $customVocab;
-        }
+        /** @var CustomVocabMergeHelper $cvHelper */
+        $cvHelper = new CustomVocabMergeHelper();
+        $payload = $cvHelper->buildUpdatePayload($customVocab, [
+            'o:label' => $label,
+            'o:item_set' => $newItemSet ?: null,
+            'o:uris' => $newUris,
+            'o:terms' => $newTerms,
+        ]);
 
-        if ($newItemSet) {
-            $this->api->update('custom_vocabs', $customVocab->id(), [
-                'o:label' => $label,
-                'o:item_set' => $newItemSet,
-                'o:terms' => [],
-                'o:uris' => [],
-            ], [], ['isPartial' => true]);
-        } elseif ($newUris) {
-            $this->api->update('custom_vocabs', $customVocab->id(), [
-                'o:label' => $label,
-                'o:item_set' => null,
-                'o:terms' => [],
-                'o:uris' => array_replace($newUris, $customVocab->uris(), $newUris),
-            ], [], ['isPartial' => true]);
-        } elseif ($newTerms) {
-            $this->api->update('custom_vocabs', $customVocab->id(), [
-                'o:label' => $label,
-                'o:item_set' => null,
-                'o:terms' => array_values(array_merge($customVocab->terms(), $newTerms)),
-                'o:uris' => [],
-            ], [], ['isPartial' => true]);
-        }
+        $this->api->update('custom_vocabs', $customVocab->id(), $payload, [], ['isPartial' => true]);
 
-        return $customVocab;
+        return $this->api->read('custom_vocabs', $customVocab->id())->getContent();
     }
 
     /**
@@ -1121,5 +1367,36 @@ SQL;
             });
         }
         return array_values($list);
+    }
+
+    /**
+     * Recursively convert objects to arrays to ensure API compatibility.
+     * 
+     * This is needed because merged resource template data may contain 
+     * ResourceReference objects that need to be converted to arrays
+     * before being sent to the API.
+     */
+    protected function deepArrayConvert($data)
+    {
+        if (is_array($data)) {
+            $result = [];
+            foreach ($data as $key => $value) {
+                $result[$key] = $this->deepArrayConvert($value);
+            }
+            return $result;
+        } elseif (is_object($data)) {
+            // Convert objects to arrays
+            if (method_exists($data, 'jsonSerialize')) {
+                return $this->deepArrayConvert($data->jsonSerialize());
+            } elseif (method_exists($data, 'toArray')) {
+                return $this->deepArrayConvert($data->toArray());
+            } else {
+                // Fallback: convert object properties to array
+                return $this->deepArrayConvert(get_object_vars($data));
+            }
+        }
+
+        // Return primitive values as-is
+        return $data;
     }
 }
